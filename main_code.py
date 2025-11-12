@@ -1,5 +1,6 @@
 import sys
 import os
+import argparse
 import numpy as np
 import pandas as pd
 import torch
@@ -633,183 +634,263 @@ import matplotlib.pyplot as plt
 from collections import Counter
 
 if __name__ == "__main__":
-    # Load and prepare data
-    data = pd.read_csv('/kaggle/input/rmllll/scaled_data.csv')  
+    parser = argparse.ArgumentParser(description="强化学习做市策略实验")
+    parser.add_argument("--use-tardis", action="store_true", help="使用 Tardis 高频数据而非本地 CSV 数据。")
+    parser.add_argument("--exchange", default="binance", help="Tardis 交易所 ID。")
+    parser.add_argument("--symbol", default="btcusdt", help="交易对字符串，例如 btcusdt。")
+    parser.add_argument("--start", default="2024-01-01T00:00:00Z", help="数据起始时间 (UTC)。")
+    parser.add_argument("--end", default="2024-01-01T00:30:00Z", help="数据结束时间 (UTC)。")
+    parser.add_argument("--max-rows", type=int, default=2000, help="截取用于训练的数据条数。")
+    parser.add_argument("--resample", default="1s", help="重采样频率，例如 500ms、1s。")
+    parser.add_argument("--tardis-api-key", default=None, help="Tardis API Key，默认读取环境变量。")
+    parser.add_argument("--data-path", default="/kaggle/input/rmllll/scaled_data.csv", help="本地 CSV 数据路径。")
+    parser.add_argument("--offset", type=int, default=600000, help="本地数据起始行号。")
+    parser.add_argument("--episodes", type=int, default=5, help="训练轮数。")
+    parser.add_argument("--max-episode-steps", type=int, default=500, help="单个 episode 的最大步数。")
+    parser.add_argument("--learning-rate", type=float, default=None, help="学习率覆盖。")
+    parser.add_argument("--entropy-coef", type=float, default=None, help="熵系数覆盖。")
+    parser.add_argument("--gamma", type=float, default=None, help="折现因子覆盖。")
+    parser.add_argument("--gae-lambda", type=float, default=None, help="GAE λ 覆盖。")
+    parser.add_argument("--reward-eta", type=float, default=None, help="奖励函数参数 η。")
+    parser.add_argument("--reward-zeta", type=float, default=None, help="奖励函数参数 ζ。")
+    parser.add_argument("--transaction-cost", type=float, default=None, help="交易成本参数覆盖。")
+    parser.add_argument("--deterministic-fill", action="store_true", help="禁用概率成交，使用确定性撮合。")
+    parser.add_argument("--use-path-signatures", action="store_true", help="启用路径签名特征 (需安装 signatory)。")
+    parser.add_argument("--quick-validation", action="store_true", help="仅执行快速验证流程。")
+    parser.add_argument("--test-episodes", type=int, default=3, help="测试阶段 episode 数量。")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default=None, help="强制指定训练设备。")
+    parser.add_argument("--skip-plots", action="store_true", help="跳过所有绘图输出。")
+    args = parser.parse_args()
+
     features = ['Bid Price 1', 'Bid Size 1', 'Ask Price 1', 'Ask Size 1', 'midprice', 'spread', 'log_return', 'RV_5min', 'RSI_5min', 'OSI_10s']
-    data_subset = data[features].iloc[600000:610000]  # 10,000 steps 
 
-    # Define configurations
-    config = Config(episodes=50, max_episode_steps=10000)  
-    reward_config = RewardConfig(eta=0.7, zeta=0.001, transaction_cost=0.0001)  
-    training_config = TrainingConfig(entropy_coef=0.05)  
+    if args.use_tardis:
+        from crypto_data_pipeline import prepare_crypto_dataset
 
-    # Set up environment
-    print("Setting up environment...")
+        print("使用 Tardis 数据构建特征...")
+        data_subset = prepare_crypto_dataset(
+            exchange=args.exchange,
+            symbol=args.symbol,
+            start=args.start,
+            end=args.end,
+            api_key=args.tardis_api_key,
+            resample=args.resample,
+            max_rows=args.max_rows,
+        )
+    else:
+        print("从本地 CSV 加载预处理数据...")
+        data = pd.read_csv(args.data_path)
+        end_idx = args.offset + args.max_rows
+        data_subset = data[features].iloc[args.offset:end_idx]
+
+    if data_subset.empty:
+        raise ValueError("选取的数据为空，请调整参数。")
+
+    max_episode_steps = min(args.max_episode_steps, len(data_subset) - 1)
+    if max_episode_steps < 10:
+        raise ValueError("有效样本不足，无法运行环境。")
+    config = Config(episodes=args.episodes, max_episode_steps=max_episode_steps)
+
+    reward_config = RewardConfig()
+    if args.reward_eta is not None:
+        reward_config.eta = args.reward_eta
+    if args.reward_zeta is not None:
+        reward_config.zeta = args.reward_zeta
+    if args.transaction_cost is not None:
+        reward_config.transaction_cost = args.transaction_cost
+
+    training_config = TrainingConfig()
+    if args.learning_rate is not None:
+        training_config.learning_rate = args.learning_rate
+    if args.entropy_coef is not None:
+        training_config.entropy_coef = args.entropy_coef
+    if args.gamma is not None:
+        training_config.gamma = args.gamma
+    if args.gae_lambda is not None:
+        training_config.gae_lambda = args.gae_lambda
+
+    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     env = EnhancedMarketMakingEnv(
         data=data_subset,
         max_episode_steps=config.max_episode_steps,
         reward_config=reward_config,
-        prob_execution=True,
-        use_path_signatures=False
+        prob_execution=not args.deterministic_fill,
+        use_path_signatures=args.use_path_signatures
     )
 
-    # Initialize policy networks
     state_dim = env.observation_space.shape[0]
-    action_dim = 9
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    action_dim = env.action_space.n
 
-    # LSTM Policy
-    lstm_policy = LSTMPolicyNetwork(state_dim, training_config.hidden_dim, action_dim, training_config.lstm_layers)
-    lstm_policy.to(device)
-    lstm_optimizer = Adam(lstm_policy.parameters(), lr=training_config.learning_rate)
+    print(f"环境初始化完成：样本数 {len(data_subset)}, 状态维度 {state_dim}, 动作空间 {action_dim}, 设备 {device}")
 
-    # MLP Policy
-    mlp_policy = MLPPolicyNetwork(state_dim, training_config.hidden_dim, action_dim)
-    mlp_policy.to(device)
-    mlp_optimizer = Adam(mlp_policy.parameters(), lr=training_config.learning_rate)
+    if args.quick_validation:
+        print("执行快速验证流程 (LSTM 策略)...")
+        lstm_policy = LSTMPolicyNetwork(state_dim, training_config.hidden_dim, action_dim, training_config.lstm_layers)
+        lstm_policy.to(device)
+        lstm_optimizer = Adam(lstm_policy.parameters(), lr=training_config.learning_rate)
+        rewards = actor_critic_train(
+            env,
+            lstm_policy,
+            lstm_optimizer,
+            config.episodes,
+            gamma=training_config.gamma,
+            entropy_coef=training_config.entropy_coef,
+            max_grad_norm=training_config.max_gradient_norm,
+            use_gae=training_config.use_gae,
+            gae_lambda=training_config.gae_lambda,
+            device=device
+        )
+        avg_reward = float(np.mean(rewards)) if rewards else 0.0
+        print(f"快速验证 - 平均训练奖励: {avg_reward:.4f}")
 
-    # Train LSTM policy
-    print("Training LSTM policy...")
-    lstm_rewards = actor_critic_train(
-        env, lstm_policy, lstm_optimizer, config.episodes,
-        gamma=training_config.gamma, entropy_coef=training_config.entropy_coef,
-        max_grad_norm=training_config.max_gradient_norm, use_gae=training_config.use_gae,
-        gae_lambda=training_config.gae_lambda, device=device
-    )
+        test_results = test_and_visualize(env, lstm_policy, num_episodes=args.test_episodes, device=device)
+        final_inventories = [episode[-1] for episode in test_results['inventories'] if episode]
+        total_pnls = [float(np.sum(episode)) for episode in test_results['pnls'] if episode]
 
-    # Train MLP policy
-    print("Training MLP policy...")
-    mlp_rewards = actor_critic_train(
-        env, mlp_policy, mlp_optimizer, config.episodes,
-        gamma=training_config.gamma, entropy_coef=training_config.entropy_coef,
-        max_grad_norm=training_config.max_gradient_norm, use_gae=training_config.use_gae,
-        gae_lambda=training_config.gae_lambda, device=device
-    )
+        if final_inventories:
+            print(f"快速验证 - 平均最终库存: {np.mean(final_inventories):.4f}")
+        if total_pnls:
+            print(f"快速验证 - 平均总 PnL: {np.mean(total_pnls):.4f}")
+    else:
+        print("Training LSTM policy...")
+        lstm_policy = LSTMPolicyNetwork(state_dim, training_config.hidden_dim, action_dim, training_config.lstm_layers)
+        lstm_policy.to(device)
+        lstm_optimizer = Adam(lstm_policy.parameters(), lr=training_config.learning_rate)
 
-    # Test the trained models
-    print("Testing the trained LSTM model...")
-    lstm_test_results = test_and_visualize(env, lstm_policy, num_episodes=config.episodes, device=device)
-    print("Testing the trained MLP model...")
-    mlp_test_results = test_and_visualize(env, mlp_policy, num_episodes=config.episodes, device=device)
+        lstm_rewards = actor_critic_train(
+            env, lstm_policy, lstm_optimizer, config.episodes,
+            gamma=training_config.gamma, entropy_coef=training_config.entropy_coef,
+            max_grad_norm=training_config.max_gradient_norm, use_gae=training_config.use_gae,
+            gae_lambda=training_config.gae_lambda, device=device
+        )
 
-    # Evaluate baseline agents
-    print("Evaluating baseline fixed-spread agent...")
-    baseline_results = baseline_fixed_spread_agent(env, fixed_bid_offset=-1.0, fixed_ask_offset=1.0, num_episodes=config.episodes)
-    print("Evaluating Avellaneda-Stoikov agent...")
-    av_st_results = baseline_avellaneda_stoikov_agent(env, risk_aversion=0.1, k=1.0, num_episodes=config.episodes)
+        print("Training MLP policy...")
+        mlp_policy = MLPPolicyNetwork(state_dim, training_config.hidden_dim, action_dim)
+        mlp_policy.to(device)
+        mlp_optimizer = Adam(mlp_policy.parameters(), lr=training_config.learning_rate)
 
-    # Plotting
-    # Total Reward per Episode lstm vs mlp
-    plt.figure(figsize=(8,5))
-    plt.plot(lstm_rewards, label='LSTM Policy (GAE)', color='blue')
-    plt.plot(mlp_rewards, label='MLP Policy (GAE)', color='purple')
-    plt.axhline(y=0, color='orange', linestyle='--', label='Fixed Spread')
-    plt.axhline(y=0, color='green', linestyle='--', label='Avellaneda-Stoikov')
-    plt.title('Total Reward per Episode', fontsize=14)
-    plt.xlabel('Episode', fontsize=12)
-    plt.ylabel('Reward', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('total_reward_per_episode.png', dpi=300)
-    plt.show()
+        mlp_rewards = actor_critic_train(
+            env, mlp_policy, mlp_optimizer, config.episodes,
+            gamma=training_config.gamma, entropy_coef=training_config.entropy_coef,
+            max_grad_norm=training_config.max_gradient_norm, use_gae=training_config.use_gae,
+            gae_lambda=training_config.gae_lambda, device=device
+        )
 
-    # Total PnL per Episode 
-    plt.figure(figsize=(8,5))
-    plt.plot([sum(ep) for ep in lstm_test_results['pnls']], label='Optimized RL Agent (LSTM)', color='blue')
-    plt.plot([sum(ep) for ep in mlp_test_results['pnls']], label='Optimized RL Agent (MLP)', color='purple')
-    plt.plot([sum(ep) for ep in baseline_results['pnls']], label='Fixed Spread', color='orange')
-    plt.plot([sum(ep) for ep in av_st_results['pnls']], label='Avellaneda-Stoikov', color='green')
-    plt.title('Total PnL per Episode', fontsize=14)
-    plt.xlabel('Episode', fontsize=12)
-    plt.ylabel('PnL', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('total_pnl_per_episode.png', dpi=300)
-    plt.show()
+        print("Testing the trained LSTM model...")
+        lstm_test_results = test_and_visualize(env, lstm_policy, num_episodes=config.episodes, device=device)
+        print("Testing the trained MLP model...")
+        mlp_test_results = test_and_visualize(env, mlp_policy, num_episodes=config.episodes, device=device)
 
-    # Final Inventory Distribution 
-    plt.figure(figsize=(8,5))
-    lstm_final_inventories = [ep[-1] for ep in lstm_test_results['inventories']]
-    mlp_final_inventories = [ep[-1] for ep in mlp_test_results['inventories']]
-    baseline_final_inventories = [ep[-1] for ep in baseline_results['inventories']]
-    av_st_final_inventories = [ep[-1] for ep in av_st_results['inventories']]
-    plt.hist(lstm_final_inventories, bins=range(-6, 2), alpha=0.5, label='Optimized RL (LSTM)', color='blue')
-    plt.hist(mlp_final_inventories, bins=range(-6, 2), alpha=0.5, label='Optimized RL (MLP)', color='purple')
-    plt.hist(baseline_final_inventories, bins=range(-6, 2), alpha=0.5, label='Fixed Spread', color='orange')
-    plt.hist(av_st_final_inventories, bins=range(-6, 2), alpha=0.5, label='Avellaneda-Stoikov', color='green')
-    plt.title('Final Inventory Distribution', fontsize=14)
-    plt.xlabel('Final Inventory', fontsize=12)
-    plt.ylabel('Frequency', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, axis='y')
-    plt.tight_layout()
-    plt.savefig('final_inventory_distribution.png', dpi=300)
-    plt.show()
+        print("Evaluating baseline fixed-spread agent...")
+        baseline_results = baseline_fixed_spread_agent(env, fixed_bid_offset=-1.0, fixed_ask_offset=1.0, num_episodes=config.episodes)
+        print("Evaluating Avellaneda-Stoikov agent...")
+        av_st_results = baseline_avellaneda_stoikov_agent(env, risk_aversion=0.1, k=1.0, num_episodes=config.episodes)
 
-    # Cumulative PnL Comparison -> Last Episode
-    plt.figure(figsize=(8,5))
-    plt.plot(np.cumsum(lstm_test_results['pnls'][-1]), label='RL Agent (LSTM)', color='blue')
-    plt.plot(np.cumsum(mlp_test_results['pnls'][-1]), label='RL Agent (MLP)', color='purple')
-    plt.plot(np.cumsum(baseline_results['pnls'][-1]), label='Fixed Spread', color='orange')
-    plt.plot(np.cumsum(av_st_results['pnls'][-1]), label='Avellaneda-Stoikov', color='green')
-    plt.title('Cumulative PnL Comparison (Last Episode)', fontsize=14)
-    plt.xlabel('Time Step', fontsize=12)
-    plt.ylabel('Cumulative PnL', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('cumulative_pnl_comparison.png', dpi=300)
-    plt.show()
+        if not args.skip_plots:
+            plt.figure(figsize=(8,5))
+            plt.plot(lstm_rewards, label='LSTM Policy (GAE)', color='blue')
+            plt.plot(mlp_rewards, label='MLP Policy (GAE)', color='purple')
+            plt.axhline(y=0, color='orange', linestyle='--', label='Fixed Spread')
+            plt.axhline(y=0, color='green', linestyle='--', label='Avellaneda-Stoikov')
+            plt.title('Total Reward per Episode', fontsize=14)
+            plt.xlabel('Episode', fontsize=12)
+            plt.ylabel('Reward', fontsize=12)
+            plt.legend(fontsize=10)
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig('total_reward_per_episode.png', dpi=300)
+            plt.show()
 
-    # Inventory Over Time -> last Epsiode
-    plt.figure(figsize=(8,5))
-    plt.plot(lstm_test_results['inventories'][-1], label='RL Agent (LSTM)', color='blue')
-    plt.plot(mlp_test_results['inventories'][-1], label='RL Agent (MLP)', color='purple')
-    plt.plot(baseline_results['inventories'][-1], label='Fixed Spread', color='orange')
-    plt.plot(av_st_results['inventories'][-1], label='Avellaneda-Stoikov', color='green')
-    plt.axhline(y=env.max_inventory, color='red', linestyle='--', label='Max Inventory')
-    plt.axhline(y=-env.max_inventory, color='red', linestyle='--')
-    plt.title('Inventory Over Time (Last Episode)', fontsize=14)
-    plt.xlabel('Time Step', fontsize=12)
-    plt.ylabel('Inventory', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('inventory_over_time.png', dpi=300)
-    plt.show()
+            plt.figure(figsize=(8,5))
+            plt.plot([sum(ep) for ep in lstm_test_results['pnls']], label='Optimized RL Agent (LSTM)', color='blue')
+            plt.plot([sum(ep) for ep in mlp_test_results['pnls']], label='Optimized RL Agent (MLP)', color='purple')
+            plt.plot([sum(ep) for ep in baseline_results['pnls']], label='Fixed Spread', color='orange')
+            plt.plot([sum(ep) for ep in av_st_results['pnls']], label='Avellaneda-Stoikov', color='green')
+            plt.title('Total PnL per Episode', fontsize=14)
+            plt.xlabel('Episode', fontsize=12)
+            plt.ylabel('PnL', fontsize=12)
+            plt.legend(fontsize=10)
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig('total_pnl_per_episode.png', dpi=300)
+            plt.show()
 
-    # Action Distribution = 9 actions
-    action_labels = ['-1.0/-1.0', '-1.0/0.0', '-1.0/1.0', '0.0/-1.0', '0.0/0.0', '0.0/1.0', '1.0/-1.0', '1.0/0.0', '1.0/1.0']
-    lstm_all_actions = []
-    mlp_all_actions = []
-    for episode_bid_offsets, episode_ask_offsets in zip(lstm_test_results['bid_offsets'], lstm_test_results['ask_offsets']):
-        actions = [f"{b}/{a}" for b, a in zip(episode_bid_offsets, episode_ask_offsets)]
-        lstm_all_actions.extend(actions)
-    for episode_bid_offsets, episode_ask_offsets in zip(mlp_test_results['bid_offsets'], mlp_test_results['ask_offsets']):
-        actions = [f"{b}/{a}" for b, a in zip(episode_bid_offsets, episode_ask_offsets)]
-        mlp_all_actions.extend(actions)
-    
-    lstm_action_counts = Counter(lstm_all_actions)
-    mlp_action_counts = Counter(mlp_all_actions)
-    
-    # ensure all 9 actions are represented
-    lstm_counts = [lstm_action_counts.get(label, 0) for label in action_labels]
-    mlp_counts = [mlp_action_counts.get(label, 0) for label in action_labels]
-    
-    x = np.arange(len(action_labels))
-    width = 0.35
-    plt.figure(figsize=(10,5))
-    plt.bar(x - width/2, lstm_counts, width, label='LSTM', color='blue')
-    plt.bar(x + width/2, mlp_counts, width, label='MLP', color='purple')
-    plt.title('Action Distribution (Bid/Ask Offsets)', fontsize=14)
-    plt.xlabel('Bid/Ask Offset Pair', fontsize=12)
-    plt.ylabel('Frequency', fontsize=12)
-    plt.xticks(x, action_labels, rotation=45)
-    plt.legend(fontsize=10)
-    plt.grid(True, axis='y')
-    plt.tight_layout()
-    plt.savefig('action_distribution.png', dpi=300)
-    plt.show()
+            plt.figure(figsize=(8,5))
+            lstm_final_inventories = [ep[-1] for ep in lstm_test_results['inventories']]
+            mlp_final_inventories = [ep[-1] for ep in mlp_test_results['inventories']]
+            baseline_final_inventories = [ep[-1] for ep in baseline_results['inventories']]
+            av_st_final_inventories = [ep[-1] for ep in av_st_results['inventories']]
+            plt.hist(lstm_final_inventories, bins=range(-6, 2), alpha=0.5, label='Optimized RL (LSTM)', color='blue')
+            plt.hist(mlp_final_inventories, bins=range(-6, 2), alpha=0.5, label='Optimized RL (MLP)', color='purple')
+            plt.hist(baseline_final_inventories, bins=range(-6, 2), alpha=0.5, label='Fixed Spread', color='orange')
+            plt.hist(av_st_final_inventories, bins=range(-6, 2), alpha=0.5, label='Avellaneda-Stoikov', color='green')
+            plt.title('Final Inventory Distribution', fontsize=14)
+            plt.xlabel('Final Inventory', fontsize=12)
+            plt.ylabel('Frequency', fontsize=12)
+            plt.legend(fontsize=10)
+            plt.grid(True, axis='y')
+            plt.tight_layout()
+            plt.savefig('final_inventory_distribution.png', dpi=300)
+            plt.show()
+
+            plt.figure(figsize=(8,5))
+            plt.plot(np.cumsum(lstm_test_results['pnls'][-1]), label='RL Agent (LSTM)', color='blue')
+            plt.plot(np.cumsum(mlp_test_results['pnls'][-1]), label='RL Agent (MLP)', color='purple')
+            plt.plot(np.cumsum(baseline_results['pnls'][-1]), label='Fixed Spread', color='orange')
+            plt.plot(np.cumsum(av_st_results['pnls'][-1]), label='Avellaneda-Stoikov', color='green')
+            plt.title('Cumulative PnL Comparison (Last Episode)', fontsize=14)
+            plt.xlabel('Time Step', fontsize=12)
+            plt.ylabel('Cumulative PnL', fontsize=12)
+            plt.legend(fontsize=10)
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig('cumulative_pnl_comparison.png', dpi=300)
+            plt.show()
+
+            plt.figure(figsize=(8,5))
+            plt.plot(lstm_test_results['inventories'][-1], label='RL Agent (LSTM)', color='blue')
+            plt.plot(mlp_test_results['inventories'][-1], label='RL Agent (MLP)', color='purple')
+            plt.plot(baseline_results['inventories'][-1], label='Fixed Spread', color='orange')
+            plt.plot(av_st_results['inventories'][-1], label='Avellaneda-Stoikov', color='green')
+            plt.axhline(y=env.max_inventory, color='red', linestyle='--', label='Max Inventory')
+            plt.axhline(y=-env.max_inventory, color='red', linestyle='--')
+            plt.title('Inventory Over Time (Last Episode)', fontsize=14)
+            plt.xlabel('Time Step', fontsize=12)
+            plt.ylabel('Inventory', fontsize=12)
+            plt.legend(fontsize=10)
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig('inventory_over_time.png', dpi=300)
+            plt.show()
+
+            action_labels = ['-1.0/-1.0', '-1.0/0.0', '-1.0/1.0', '0.0/-1.0', '0.0/0.0', '0.0/1.0', '1.0/-1.0', '1.0/0.0', '1.0/1.0']
+            lstm_all_actions = []
+            mlp_all_actions = []
+            for episode_bid_offsets, episode_ask_offsets in zip(lstm_test_results['bid_offsets'], lstm_test_results['ask_offsets']):
+                actions = [f"{b}/{a}" for b, a in zip(episode_bid_offsets, episode_ask_offsets)]
+                lstm_all_actions.extend(actions)
+            for episode_bid_offsets, episode_ask_offsets in zip(mlp_test_results['bid_offsets'], mlp_test_results['ask_offsets']):
+                actions = [f"{b}/{a}" for b, a in zip(episode_bid_offsets, episode_ask_offsets)]
+                mlp_all_actions.extend(actions)
+
+            lstm_action_counts = Counter(lstm_all_actions)
+            mlp_action_counts = Counter(mlp_all_actions)
+
+            lstm_counts = [lstm_action_counts.get(label, 0) for label in action_labels]
+            mlp_counts = [mlp_action_counts.get(label, 0) for label in action_labels]
+
+            x = np.arange(len(action_labels))
+            width = 0.35
+            plt.figure(figsize=(10,5))
+            plt.bar(x - width/2, lstm_counts, width, label='LSTM', color='blue')
+            plt.bar(x + width/2, mlp_counts, width, label='MLP', color='purple')
+            plt.title('Action Distribution (Bid/Ask Offsets)', fontsize=14)
+            plt.xlabel('Bid/Ask Offset Pair', fontsize=12)
+            plt.ylabel('Frequency', fontsize=12)
+            plt.xticks(x, action_labels, rotation=45)
+            plt.legend(fontsize=10)
+            plt.grid(True, axis='y')
+            plt.tight_layout()
+            plt.savefig('action_distribution.png', dpi=300)
+            plt.show()
